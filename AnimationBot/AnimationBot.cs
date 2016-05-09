@@ -123,9 +123,14 @@ namespace OpenMetaverse.AnimationBot
   class AnimationBotManager
   {
     /// <summary>
-    /// Parameters for a single bot account
+    /// Main client object for interfacing with OpenMetaverse worlds
     /// </summary>
     GridClient gridClient;
+    public GridClient Client { get { return gridClient; } }
+
+    /// <summary>
+    /// Parameters for a single bot account
+    /// </summary>
     string strFirstName, strLastName, strPassword;
 
     /// <summary>
@@ -140,6 +145,12 @@ namespace OpenMetaverse.AnimationBot
     string strImRecipientName = String.Empty;
     ManualResetEvent avatarNameSearchEvent = new ManualResetEvent(false);
     Dictionary<string, UUID> mapAvatarNameToKey = new Dictionary<string, UUID>();
+
+    /// <summary>
+    /// Timer for periodic operations
+    /// </summary>
+    System.Timers.Timer periodicActionsTimer;
+    const int periodActionsUpdatePeriod = 500; // 0.5 seconds
 
     /// <summary>
     /// Class version
@@ -192,6 +203,15 @@ namespace OpenMetaverse.AnimationBot
       // Set callbacks to handle selected session events.
       gridClient.Self.IM += new EventHandler<InstantMessageEventArgs>(InstantMessageCallback);
       gridClient.Self.ScriptQuestion += new EventHandler<ScriptQuestionEventArgs>(ScriptQuestionCallback);
+      gridClient.Inventory.InventoryObjectOffered += new EventHandler<InventoryObjectOfferedEventArgs>(InventoryObjectOfferedCallback);
+
+      // Enable handling of autopilot alerts.
+      gridClient.Network.RegisterCallback(PacketType.AlertMessage, AlertMessageHandler);
+
+      // Enable periodic actions.
+      periodicActionsTimer = new System.Timers.Timer(periodActionsUpdatePeriod);
+      periodicActionsTimer.Elapsed += new System.Timers.ElapsedEventHandler(PeriodicActionsTimerElapsedHandler);
+      periodicActionsTimer.Start();
 
       return true;
     }
@@ -206,13 +226,29 @@ namespace OpenMetaverse.AnimationBot
     }
 
     /// <summary>
+    /// Callback: Accept offered inventory item.
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    private void
+    InventoryObjectOfferedCallback(
+      object sender,
+      InventoryObjectOfferedEventArgs e)
+    {
+      Tools.LogInfo("Accepting offered inventory item\n");
+
+      // Accept offered items automatically (default is false).
+      e.Accept = true;
+    }
+
+    /// <summary>
     /// Callback: Provide a response to selected questions asked by in-world scripts.  This is
     /// mainly for approving avatar animation requests sent by animation objects (e.g., pose
     /// balls).
     /// </summary>
     /// <param name="sender"></param>
     /// <param name="e"></param>
-    void
+    private void
     ScriptQuestionCallback(
       object sender,
       ScriptQuestionEventArgs e)
@@ -234,7 +270,8 @@ namespace OpenMetaverse.AnimationBot
     /// </summary>
     /// <param name="sender"></param>
     /// <param name="e"></param>
-    void InstantMessageCallback(
+    private void
+    InstantMessageCallback(
       object sender,
       InstantMessageEventArgs e)
     {
@@ -302,7 +339,8 @@ namespace OpenMetaverse.AnimationBot
     /// </summary>
     /// <param name="sender"></param>
     /// <param name="e"></param>
-    void AvatarUuidCallback(
+    private void
+    AvatarUuidCallback(
       object sender,
       AvatarPickerReplyEventArgs e)
     {
@@ -412,7 +450,7 @@ namespace OpenMetaverse.AnimationBot
     /// </summary>
     /// <param name="sender"></param>
     /// <param name="e"></param>
-    void
+    private void
     ObjectPropertiesCallback(
       object sender,
       ObjectPropertiesEventArgs e)
@@ -476,7 +514,6 @@ namespace OpenMetaverse.AnimationBot
       SitOnObject(new List<string>() { objectUuid.ToString() });
     }
 
-
     /// <summary>
     /// Via heuristics, attempt to find and use a nearby pose-ball object.  These are
     /// typically rezzed near an avatar by clicking on a pose-ball provider (e.g, for
@@ -517,6 +554,224 @@ namespace OpenMetaverse.AnimationBot
     }
 
     /// <summary>
+    /// Pay L$ to an object.
+    /// </summary>
+    /// <param name="argumentList"></param>
+    public void
+    PayObject(
+      List<string> argumentList)
+    {
+      if (argumentList.Count != 2)
+      {
+        Tools.Log("Usage: pay [UUID] [amount]\n");
+        return;
+      }
+
+      UUID targetUuid;
+      int paymentAmount;
+
+      if (!UUID.TryParse(argumentList[0], out targetUuid))
+      {
+        Tools.LogWarn("Invalid object UUID: " + argumentList[0] + "\n");
+        return;
+      }
+
+      if (!Int32.TryParse(argumentList[1], out paymentAmount))
+      {
+        Tools.LogWarn("Invalid paymeny amount: " + argumentList[1] + "\n");
+        return;
+      }
+
+      gridClient.Self.GiveObjectMoney(targetUuid, paymentAmount, "");
+      Tools.LogInfo("Paid object " + targetUuid.ToString() + " " + paymentAmount + "\n");
+    }
+
+    /// <summary>
+    /// Callback: Execute period actions when timer has elapsed.
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    private void
+    PeriodicActionsTimerElapsedHandler(
+      object sender,
+      System.Timers.ElapsedEventArgs e)
+    {
+      if (bFollowActive)
+        PeriodicFollowUpdate();
+    }
+
+    /// <summary>
+    /// Parameters for following avatars
+    /// </summary>
+    const float DISTANCE_BUFFER = 3.0f;
+    uint targetLocalID = 0;
+    bool bFollowActive = false;
+    string strFollowAvatarName = null;
+
+    /// <summary>
+    /// Start or stop following the specified target avatar. This code is adapted from the
+    /// libomv test client.
+    /// </summary>
+    /// <param name="argumentList"></param>
+    void
+    FollowAvatar(
+      List<string> argumentList)
+    {
+      if (argumentList.Count < 1)
+      {
+        Tools.Log("Usage: follow [First] [Last or Resident]\n");
+        return;
+      }
+
+      string strTargetAvatarName = argumentList[0];
+      if ("off" == strTargetAvatarName)
+      {
+        bFollowActive = false;
+        targetLocalID = 0;
+        gridClient.Self.AutoPilotCancel();
+        Tools.LogInfo("Stopped following\n");
+        return;
+      }
+
+      strTargetAvatarName += ((argumentList.Count > 1) ? " " + argumentList[1] : " Resident");
+
+      strFollowAvatarName = strTargetAvatarName;
+      lock (gridClient.Network.Simulators)
+      {
+        for (int i = 0; i < gridClient.Network.Simulators.Count; i++)
+        {
+          Avatar targetAvatar = gridClient.Network.Simulators[i].ObjectsAvatars.Find(
+            delegate (Avatar avatar)
+            {
+              return avatar.Name == strTargetAvatarName;
+            });
+
+          if (targetAvatar != null)
+          {
+            targetLocalID = targetAvatar.LocalID;
+            bFollowActive = true;
+            Tools.LogInfo("Starting to follow " + strTargetAvatarName + "\n");
+            return;
+          }
+        }
+      }
+
+      if (bFollowActive)
+      {
+        gridClient.Self.AutoPilotCancel();
+        bFollowActive = false;
+      }
+
+      Tools.LogWarn("Unable to follow " + strTargetAvatarName + ". Client may not be able to see that avatar.\n");
+    }
+
+    /// <summary>
+    /// This function should be called regularly (e.g., every 1/2 second) to implement
+    /// following avatars.
+    /// </summary>
+	  void
+    PeriodicFollowUpdate()
+    {
+      if (bFollowActive)
+      {
+        // Find the target position
+        lock (gridClient.Network.Simulators)
+        {
+          for (int i = 0; i < gridClient.Network.Simulators.Count; i++)
+          {
+            Avatar targetAv;
+
+            if (gridClient.Network.Simulators[i].ObjectsAvatars.TryGetValue(targetLocalID, out targetAv))
+            {
+              float distance = 0.0f;
+
+              if (gridClient.Network.Simulators[i] == gridClient.Network.CurrentSim)
+              {
+                distance = Vector3.Distance(targetAv.Position, gridClient.Self.SimPosition);
+              }
+              else
+              {
+                // FIXME: Calculate global distances
+              }
+
+              if (distance > DISTANCE_BUFFER)
+              {
+                uint regionX, regionY;
+                Utils.LongToUInts(gridClient.Network.Simulators[i].Handle, out regionX, out regionY);
+
+                double xTarget = (double)targetAv.Position.X + (double)regionX;
+                double yTarget = (double)targetAv.Position.Y + (double)regionY;
+                double zTarget = targetAv.Position.Z - 2f;
+
+                Logger.DebugLog(String.Format("[Autopilot] {0} meters away from the target, starting autopilot to <{1},{2},{3}>",
+                  distance, xTarget, yTarget, zTarget), gridClient);
+                Tools.LogInfo(String.Format("[Autopilot] {0} meters away from the target, starting autopilot to <{1},{2},{3}>",
+                  distance, xTarget, yTarget, zTarget));
+
+                gridClient.Self.AutoPilot(xTarget, yTarget, zTarget);
+              }
+              else
+              {
+                // We are in range of the target and moving, stop moving
+                gridClient.Self.AutoPilotCancel();
+              }
+            }
+          }
+        }
+      }
+    }
+
+    /// <summary>
+    /// Callback: Handle autopilot alers for following avatars.
+    /// </summary>
+    /// <param name="sender"></param>
+    /// <param name="e"></param>
+    private void
+    AlertMessageHandler(
+      object sender,
+      PacketReceivedEventArgs e)
+    {
+      Packet packet = e.Packet;
+
+      AlertMessagePacket alert = (AlertMessagePacket)packet;
+      string message = Utils.BytesToString(alert.AlertData.Message);
+
+      if (message.Contains("Autopilot cancel"))
+      {
+        Logger.Log("FollowCommand: " + message, Helpers.LogLevel.Info, gridClient);
+      }
+    }
+
+    /// <summary>
+    /// Execute a teleport.
+    /// </summary>
+    /// <param name="argumentList"></param>
+    public void
+    Teleport(
+      List<string> argumentList)
+    {
+      if (argumentList.Count != 4)
+      {
+        Tools.Log("Usage: tp [sim_name] [x] [y] [z]\n");
+        return;
+      }
+
+      int x, y, z;
+      if (Int32.TryParse(argumentList[1], out x) && Int32.TryParse(argumentList[2], out y) && Int32.TryParse(argumentList[3], out z))
+      {
+        // Format: Elysian_Fields --> Elysian Fields
+        string strSimName = argumentList[0].Replace('_', ' ');
+        if (gridClient.Self.Teleport(strSimName, new Vector3(x, y, z)))
+          Tools.LogInfo("Teleported to " + gridClient.Network.CurrentSim + " (" + strSimName + "/" + x + "/" + y + "/" + z + ")");
+        else
+          Tools.LogInfo("Error: Failed teleport to " + strSimName + "/" + x + "/" + y + "/" + z + "\n" +
+            gridClient.Self.TeleportMessage);
+      }
+      else
+        Tools.LogWarn("Invalid TP arguments\n");
+    }
+
+    /// <summary>
     /// Display available console commands.
     /// </summary>
     public void
@@ -529,6 +784,9 @@ namespace OpenMetaverse.AnimationBot
       Tools.Log("  pose                                 - try to find and use a nearby pose ball\n");
       Tools.Log("  stand                                - stand (canceling animation)\n");
       Tools.Log("  im [first] [last] [message]          - send a private IM to an avatar\n");
+      Tools.Log("  pay [UUID]                           - give L$ to an object (for purchases)\n");
+      Tools.Log("  follow [First|off] [Last|Resident]   - start or stop following an avatar\n");
+      Tools.Log("  tp [sim x y z]                       - teleport to sim/x/y/z\n");
       Tools.Log("  quit                                 - logout and exit program\n");
       Tools.Log("\n");
     }
@@ -560,6 +818,12 @@ namespace OpenMetaverse.AnimationBot
           gridClient.Self.Stand();
         else if ("im" == strCommand)
           SendInstantMessage(argumentList);
+        else if ("pay" == strCommand)
+          PayObject(argumentList);
+        else if ("follow" == strCommand)
+          FollowAvatar(argumentList);
+        else if ("tp" == strCommand)
+          Teleport(argumentList);
         else if ("quit" == strCommand)
           break;
         else if ("" != strCommand)
